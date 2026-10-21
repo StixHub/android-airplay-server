@@ -23,9 +23,9 @@ class VideoRenderer(ctx: Context) {
     private var currentH265 = false
     private var videoWidth = 0
     private var videoHeight = 0
-    private var firstOutputReceived = false
     private var streamRevision = 0L
     private var decoderStartsAllowed = true
+    private var sessionFramesAllowed = true
 
     // stats
     @Volatile var fps = 0; private set
@@ -145,14 +145,21 @@ class VideoRenderer(ctx: Context) {
     }
 
     fun startSession() = synchronized(lock) {
+        sessionFramesAllowed = true
         streamRevision++
         lock.notifyAll()
         _resetStats()
     }
 
-    fun stopSession() = synchronized(lock) {
+    fun prepareForSessionStop() = synchronized(lock) {
+        // Called synchronously before the native mirror thread is joined.
+        sessionFramesAllowed = false
         streamRevision++
         lock.notifyAll()
+    }
+
+    fun stopSession() = synchronized(lock) {
+        prepareForSessionStop()
         stopCodec()
     }
 
@@ -189,7 +196,7 @@ class VideoRenderer(ctx: Context) {
 
     fun feedFrame(data: ByteArray, ntpTimeNs: Long, isH265: Boolean) {
         synchronized(lock) {
-            if (!decoderStartsAllowed) return
+            if (!decoderStartsAllowed || !sessionFramesAllowed) return
             _updateStats(data.size)
             if (videoWidth == 0 || videoHeight == 0) return
 
@@ -204,8 +211,7 @@ class VideoRenderer(ctx: Context) {
 
             try {
                 if (codec == null && !startCodec(isH265)) return@synchronized
-                _feedToCodec(data, ntpTimeNs)
-                drainOutput()
+                if (_feedToCodec(data, ntpTimeNs)) drainOutput()
             } catch (e: Exception) {
                 Log.w(TAG, "Codec error, resetting", e)
                 stopCodec()
@@ -213,26 +219,31 @@ class VideoRenderer(ctx: Context) {
         }
     }
 
-    private fun _feedToCodec(data: ByteArray, ntpTimeNs: Long) {
-        val c = codec ?: return
-        // dropping a frame desyncs decoder until the next keyframe, but source would only send one on (re)connect
-        // Enqueueing an input is not proof that a cold decoder is ready. Keep
-        // the startup budget until it produces output, or early reference frames
-        // can be discarded while the hardware is still initializing.
-        val retries = if (firstOutputReceived) FEED_RETRIES else FIRST_FEED_RETRIES
-        repeat(retries) {
-            val idx = c.dequeueInputBuffer(FEED_WAIT_US)
-            if (idx >= 0) {
-                val buf = c.getInputBuffer(idx) ?: return
-                buf.clear()
-                buf.put(data)
-                c.queueInputBuffer(idx, 0, data.size, ntpTimeNs / 1000, 0)
-                return
+    private fun _feedToCodec(data: ByteArray, ntpTimeNs: Long): Boolean {
+        val c = codec ?: return false
+        val revision = streamRevision
+        val started = SystemClock.uptimeMillis()
+        var reportedStall = false
+        val idx = awaitCodecInput(
+            lock,
+            { c === codec && revision == streamRevision && decoderStartsAllowed && sessionFramesAllowed },
+            { c.dequeueInputBuffer(FEED_WAIT_US) },
+            {
+                drainOutput()
+                if (!reportedStall && SystemClock.uptimeMillis() - started >= 200) {
+                    reportedStall = true
+                    Log.w(TAG, "Decoder input backpressure; retaining compressed frame")
+                }
             }
-            drainOutput()
+        ) ?: return false
+        val buffer = checkNotNull(c.getInputBuffer(idx)) { "Decoder input buffer unavailable" }
+        buffer.clear()
+        buffer.put(data)
+        c.queueInputBuffer(idx, 0, data.size, ntpTimeNs / 1000, 0)
+        if (reportedStall) {
+            Log.i(TAG, "Decoder input resumed after ${SystemClock.uptimeMillis() - started}ms; frame retained")
         }
-        droppedFrames++
-        Log.w(TAG, "Decoder input queue full; dropping frame. drops=$droppedFrames")
+        return true
     }
 
     private fun _isKeyframe(data: ByteArray, isH265: Boolean): Boolean {
@@ -290,7 +301,6 @@ class VideoRenderer(ctx: Context) {
         val mime = if (h265) DecoderSelector.HEVC else DecoderSelector.AVC
         val info = (if (h265) hevcDecoder else avcDecoder) ?: error("no decoder selected for $mime")
 
-        firstOutputReceived = false
         try {
             _startWithLadder(info, mime, s, h265)
         } catch (e: Exception) {
@@ -387,7 +397,6 @@ class VideoRenderer(ctx: Context) {
         while (true) {
             val idx = c.dequeueOutputBuffer(info, 0)
             if (idx < 0) break
-            firstOutputReceived = true
             _recordOutputFrameTime()
             if (scheduledOutputBufferRelease) {
                 // schedule frame at VSYNC matching its NTP presentation time
@@ -442,7 +451,5 @@ class VideoRenderer(ctx: Context) {
         private const val TAG = "VideoRenderer"
         private const val BENCH_TAG = "BENCHMARK"
         private const val FEED_WAIT_US = 20_000L
-        private const val FEED_RETRIES = 10
-        private const val FIRST_FEED_RETRIES = 50
     }
 }

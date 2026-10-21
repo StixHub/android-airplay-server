@@ -899,6 +899,10 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         log("DACP: $dacpId")
     }
 
+    override fun onMirrorStopping() {
+        videoRenderer.prepareForSessionStop()
+    }
+
     override fun onMirrorRunning(running: Boolean) {
         if (running) videoRenderer.startSession() else {
             videoRenderer.stopSession()
