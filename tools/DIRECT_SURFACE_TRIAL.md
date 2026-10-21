@@ -120,3 +120,41 @@ With direct mode disabled, the test only
 checks that the normal preview is restored. This test does not prove retained
 pixels, hardware composition, codec switching or physical-panel resolution;
 those need a real stream and the separate dump/visual checks above.
+
+## Cold-decoder input backpressure
+
+Severe block corruption was also reproduced with `direct_surface=false` after
+browsing and rotating the sender. The log recorded a compressed-frame discard
+278 ms after starting the MStar HEVC codec. This failure is not confined to the
+new SurfaceView path. It does not establish that every earlier green frame had
+the same cause.
+
+The input retry policy previously switched from its startup budget (up to 1 s
+per input) to 200 ms immediately after enqueueing one input. A queued input does
+not establish decoder readiness. Retain the startup budget until an output
+buffer is received instead. Retry constants and the steady-state policy stay
+unchanged; this does not promise recovery from later stalls or lost network data.
+PR #60 revision `d6d75e7` also retains the input-enqueued readiness policy; this
+is a separate measured startup case, not a performance comparison with H10.
+
+Generate a synthetic 30-frame 3840x1768 HEVC fixture with FFmpeg/libx265, then
+build and install the debug application and its instrumentation APK:
+
+```sh
+python3 tools/generate_warmup_fixture.py
+./gradlew assembleDebug assembleDebugAndroidTest
+adb shell am instrument -w -e test_case codec_warmup io.github.jqssun.airplay.test/io.github.jqssun.airplay.ui.SurfaceContinuityInstrumentation
+```
+
+Run while idle, with competing receivers stopped. This invokes the real
+VideoRenderer and MediaCodec in GL mode, submits a TCP-like access-unit burst,
+requires real decoded output, and fails if any compressed input is discarded.
+Each renderer is released before the next cold start. The generated binary is
+ignored by Git and contains no phone footage. Use the actual test package when
+building with a separate applicationId.
+
+On MiTV-MSSP1 / Android 9 / PI.5925, the original policy failed the first cold
+start with two discarded frames. With the readiness change, the identical
+installed test fixture passed three cold starts with output and zero discarded
+frames. This verifies the startup discard regression, not visual absence of
+all HEVC corruption or behavior on other decoders.

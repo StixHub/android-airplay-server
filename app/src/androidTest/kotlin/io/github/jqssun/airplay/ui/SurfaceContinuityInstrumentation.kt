@@ -33,13 +33,19 @@ import java.util.concurrent.TimeUnit
 @OptIn(InternalComposeUiApi::class)
 class SurfaceContinuityInstrumentation : Instrumentation() {
     private var skipNavigation = false
+    private var testCase: String? = null
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
+        testCase = arguments?.getString("test_case")
         skipNavigation = arguments?.getString("skip_navigation") == "true"
         start()
     }
 
     override fun onStart() {
+        if (testCase == "codec_warmup") {
+            CodecWarmupRegression.run(this)
+            return
+        }
         var bound = false
         var service: AirPlayService? = null
         val connected = CountDownLatch(1)
