@@ -23,7 +23,7 @@ class VideoRenderer(ctx: Context) {
     private var currentH265 = false
     private var videoWidth = 0
     private var videoHeight = 0
-    private var firstFrameQueued = false
+    private var firstOutputReceived = false
     private var streamRevision = 0L
     private var decoderStartsAllowed = true
 
@@ -216,7 +216,10 @@ class VideoRenderer(ctx: Context) {
     private fun _feedToCodec(data: ByteArray, ntpTimeNs: Long) {
         val c = codec ?: return
         // dropping a frame desyncs decoder until the next keyframe, but source would only send one on (re)connect
-        val retries = if (firstFrameQueued) FEED_RETRIES else FIRST_FEED_RETRIES
+        // Enqueueing an input is not proof that a cold decoder is ready. Keep
+        // the startup budget until it produces output, or early reference frames
+        // can be discarded while the hardware is still initializing.
+        val retries = if (firstOutputReceived) FEED_RETRIES else FIRST_FEED_RETRIES
         repeat(retries) {
             val idx = c.dequeueInputBuffer(FEED_WAIT_US)
             if (idx >= 0) {
@@ -224,7 +227,6 @@ class VideoRenderer(ctx: Context) {
                 buf.clear()
                 buf.put(data)
                 c.queueInputBuffer(idx, 0, data.size, ntpTimeNs / 1000, 0)
-                firstFrameQueued = true
                 return
             }
             drainOutput()
@@ -288,7 +290,7 @@ class VideoRenderer(ctx: Context) {
         val mime = if (h265) DecoderSelector.HEVC else DecoderSelector.AVC
         val info = (if (h265) hevcDecoder else avcDecoder) ?: error("no decoder selected for $mime")
 
-        firstFrameQueued = false
+        firstOutputReceived = false
         try {
             _startWithLadder(info, mime, s, h265)
         } catch (e: Exception) {
@@ -385,6 +387,7 @@ class VideoRenderer(ctx: Context) {
         while (true) {
             val idx = c.dequeueOutputBuffer(info, 0)
             if (idx < 0) break
+            firstOutputReceived = true
             _recordOutputFrameTime()
             if (scheduledOutputBufferRelease) {
                 // schedule frame at VSYNC matching its NTP presentation time
