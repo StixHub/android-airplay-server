@@ -67,11 +67,11 @@ logged. The timeout path does not guarantee hardware composition.
   frame on return. Retaining a UI view does not promise retention across OS
   window destruction; background/resume and activity recreation remain explicit
   validation cases before claiming equivalence with the GL texture path.
-- Intermittent green/block-corrupted HEVC frames were observed on both the earlier
-  deployed direct-output build and the current upstream-based trial. A process restart/reconnect restored normal
-  video; full buffer dimensions and Device composition alone did not detect the
-  corruption. Its root cause is not established, so this trial does not claim
-  to fix that separate rendering/decoding failure.
+- Intermittent green/block-corrupted HEVC frames were observed in earlier builds
+  before the final input-retention fix, with both direct and GL output. Full
+  buffer dimensions and Device composition alone did not detect the corruption.
+  The final sender trial is recorded below; it does not establish the cause of
+  every earlier failure or prove long-term absence of vendor decoder errors.
 - The mode is experimental, opt-in, and has not been validated across devices.
 
 Baseline on Xiaomi MiTV-MSSP1 / Android 9 / PI.5925: HEVC stream 994x2160
@@ -91,6 +91,14 @@ actual aspect-correct preview/fullscreen slot, while the other UI stays opaque.
 The startup wait and EGL-detach handshake address the measured Xiaomi first-
 connection path; the comparison is not a claim that it outperforms the H10
 implementation on other hardware or fixes its audio synchronization issues.
+
+[PR #74](https://github.com/jqssun/android-airplay-server/pull/74), revision
+`c2a3a98`, changes the same frame and geometry code for macOS screen extension,
+including a direct ByteBuffer JNI path, advertised dimensions and GL aspect
+fitting. It retains the GL output path and bounded compressed-input retries.
+This trial instead targets display output and cancellation-aware input
+retention; it does not replace those screen-extension changes. The overlapping
+renderer and JNI changes will need reconciliation if both contributions land.
 
 ## Native view continuity regression (Android TV)
 
@@ -185,7 +193,7 @@ buffer for 3840x1768 landscape input; captured images looked normal in both
 orientations.
 
 The user then reported three connections from the iPhone and three from a
-computer, with good image quality throughout the requested browsing, rotation
+MacBook, with good image quality throughout the requested browsing, rotation
 and reconnection trial. The receiver process remained alive, and the retained
 tail of the device log records completed sender teardown without a codec error.
 That log does not cover all six connections; the six-connection visual result
