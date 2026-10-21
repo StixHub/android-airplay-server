@@ -35,6 +35,7 @@ android {
         targetSdk = 37
         versionCode = 36
         versionName = "0.0.36"
+        testInstrumentationRunner = "io.github.jqssun.airplay.ui.SurfaceContinuityInstrumentation"
 
         externalNativeBuild {
             cmake {

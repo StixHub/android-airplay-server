@@ -405,6 +405,8 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         val aac = prefs[Prefs.AAC_ENABLED]
 
         videoRenderer.enforceSdr = prefs[Prefs.ENFORCE_SDR]
+        videoRenderer.directSurface = prefs[Prefs.DIRECT_SURFACE]
+        videoRenderer.prepareForServerStart()
         videoRenderer.keyAllowFrameDrop = prefs[Prefs.KEY_ALLOW_FRAME_DROP]
         videoRenderer.selector.maxOperatingRate = Prefs.forced(prefs[Prefs.OPERATING_RATE])
         videoRenderer.benchmarkLog = prefs[Prefs.BENCHMARK_LOG]
@@ -532,6 +534,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
 
     private fun _shutdown() {
+        videoRenderer.prepareForServerStop()
         audioRenderer.detachEngine()
         if (nativeHandle != 0L) {
             NativeBridge.nativeStop(nativeHandle)
