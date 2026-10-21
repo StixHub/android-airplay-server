@@ -174,3 +174,20 @@ visual absence of all HEVC corruption; exercise a real sender and rotation too.
 PR #60 revision `d6d75e7` still uses an input-enqueued flag to select a bounded
 retry budget. This addresses a shared baseline input-loss case, separately from
 its H10 view-retention and audio synchronization work.
+
+## Device trial results
+
+On Xiaomi MiTV-MSSP1 / Android 9, the final input-retention build produced real
+output on three synthetic HEVC cold starts. The surface continuity check also
+passed through Overview -> Logs -> Overview. A real iPhone stream reached a
+1008x2160 hardware-composed buffer for 994x2160 portrait input and a 3840x1776
+buffer for 3840x1768 landscape input; captured images looked normal in both
+orientations.
+
+The user then reported three connections from the iPhone and three from a
+computer, with good image quality throughout the requested browsing, rotation
+and reconnection trial. The receiver process remained alive, and the retained
+tail of the device log records completed sender teardown without a codec error.
+That log does not cover all six connections; the six-connection visual result
+is the user's observation. No long-term or cross-device stability claim is made.
+End-to-end latency was not measured or optimized in this trial.
