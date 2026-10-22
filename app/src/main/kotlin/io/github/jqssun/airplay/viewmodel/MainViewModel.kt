@@ -18,6 +18,8 @@ import io.github.jqssun.airplay.service.AirPlayService
 import io.github.jqssun.airplay.service.AirPlayService.ServerState
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -197,6 +199,10 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
     val logs: StateFlow<List<String>> = _logs.asStateFlow()
     private val _logLock = Any()
     private val _logList = mutableListOf<String>()
+    // Rewriting the whole file for every line stalled callers, including the
+    // video frame thread, for ~100ms per line on slow TV storage.
+    private val _logPersist = Executors.newSingleThreadScheduledExecutor { Thread(it, "LogPersist").apply { isDaemon = true } }
+    private var _logPersistScheduled = false
     private val _dateFmt = object : ThreadLocal<SimpleDateFormat>() {
         override fun initialValue() = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     }
@@ -211,7 +217,10 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
         synchronized(_logLock) {
             _logList.add(line)
             while (_logList.size > 9999) _logList.removeAt(0)
-            persistLogsLocked()
+            if (!_logPersistScheduled) {
+                _logPersistScheduled = true
+                _logPersist.schedule(::persistLogs, LOG_PERSIST_DELAY_MS, TimeUnit.MILLISECONDS)
+            }
             snapshot = _logList.toList()
         }
         _logs.value = snapshot
@@ -252,10 +261,17 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
         _logs.value = snapshot
     }
 
-    private fun persistLogsLocked() {
-        runCatching {
-            logFile.writeText(_logList.joinToString("\n"))
+    private fun persistLogs() {
+        val text = synchronized(_logLock) {
+            _logPersistScheduled = false
+            _logList.joinToString("\n")
         }
+        runCatching { logFile.writeText(text) }
+    }
+
+    // A pending write still runs after shutdown(); then the thread exits.
+    override fun onCleared() {
+        _logPersist.shutdown()
     }
 
     // service binding
@@ -437,5 +453,6 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
         const val SCRUB_SETTLE_TIMEOUT_MS = 3_000L
         // raise if the play/pause icon flickers back right after a local toggle
         const val VIDEO_ACTION_SYNC_HOLD_MS = 700L
+        const val LOG_PERSIST_DELAY_MS = 2_000L
     }
 }
