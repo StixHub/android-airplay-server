@@ -407,7 +407,9 @@ class VideoRenderer(ctx: Context) {
                 }
                 c.releaseOutputBuffer(idx, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
             } else {
-                c.releaseOutputBuffer(idx, true)
+                // AirPlay PTS uses an NTP epoch; SurfaceView timestamps must use
+                // the monotonic clock, including immediate output.
+                c.releaseOutputBuffer(idx, System.nanoTime())
             }
         }
     }
