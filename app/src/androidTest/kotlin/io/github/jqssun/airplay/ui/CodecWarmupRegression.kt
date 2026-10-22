@@ -34,18 +34,16 @@ object CodecWarmupRegression {
                     frames.forEachIndexed { index, frame ->
                         renderer.feedFrame(frame, origin + index * 33_333_333L, true)
                     }
-                    val drain = renderer.javaClass.getDeclaredMethod("drainOutput").apply { isAccessible = true }
-                    val lastOutput = renderer.javaClass.getDeclaredField("_lastOutputFrameNs").apply { isAccessible = true }
+                    // Output is released by the renderer's own thread, without further input.
                     val deadline = SystemClock.uptimeMillis() + 3000
-                    while (lastOutput.getLong(renderer) == 0L && SystemClock.uptimeMillis() < deadline) {
-                        drain.invoke(renderer)
+                    while (renderer.decodedFrames == 0L && SystemClock.uptimeMillis() < deadline) {
                         SystemClock.sleep(10)
                     }
-                    check(lastOutput.getLong(renderer) > 0L) { "Real decoder produced no output" }
+                    check(renderer.decodedFrames > 0L) { "Real decoder produced no output" }
                     check(renderer.droppedFrames == 0L) {
                         "Cold start ${attempt + 1} discarded ${renderer.droppedFrames} compressed reference frame(s)"
                     }
-                    sendStatus(0, Bundle().apply { putString("stream", "Cold start ${attempt + 1}: real output, no compressed frames discarded\n") })
+                    sendStatus(0, Bundle().apply { putString("stream", "Cold start ${attempt + 1}: ${renderer.decodedFrames} real outputs, no compressed frames discarded\n") })
                 } finally {
                     renderer.release()
                 }

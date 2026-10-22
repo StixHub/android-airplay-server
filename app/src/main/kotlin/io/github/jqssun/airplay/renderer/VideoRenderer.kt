@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
@@ -18,6 +19,7 @@ class VideoRenderer(ctx: Context) {
     private var hevcDecoder: MediaCodecInfo? = null
     private var maxFps = 0
     private var codec: MediaCodec? = null
+    private var outputDrainer: OutputDrainer? = null
     private var codecSurface: Surface? = null
     private var displaySurface: Surface? = null
     private var currentH265 = false
@@ -33,6 +35,7 @@ class VideoRenderer(ctx: Context) {
     @Volatile var frameCount = 0L; private set
     @Volatile var codecName = ""; private set
     @Volatile var droppedFrames = 0L; private set
+    @Volatile var decodedFrames = 0L; private set
     @Volatile var framePacingJitterUs = 0L; private set
 
     var enforceSdr = true
@@ -165,7 +168,7 @@ class VideoRenderer(ctx: Context) {
 
     private fun _resetStats() {
         fps = 0; bitrateBps = 0; frameCount = 0; codecName = ""
-        droppedFrames = 0; framePacingJitterUs = 0
+        droppedFrames = 0; decodedFrames = 0; framePacingJitterUs = 0
         _framesThisSec = 0; _bytesThisSec = 0
     }
 
@@ -211,7 +214,7 @@ class VideoRenderer(ctx: Context) {
 
             try {
                 if (codec == null && !startCodec(isH265)) return@synchronized
-                if (_feedToCodec(data, ntpTimeNs)) drainOutput()
+                _feedToCodec(data, ntpTimeNs)
             } catch (e: Exception) {
                 Log.w(TAG, "Codec error, resetting", e)
                 stopCodec()
@@ -229,7 +232,7 @@ class VideoRenderer(ctx: Context) {
             { c === codec && revision == streamRevision && decoderStartsAllowed && sessionFramesAllowed },
             { c.dequeueInputBuffer(FEED_WAIT_US) },
             {
-                drainOutput()
+                // The output thread keeps draining while input waits here.
                 if (!reportedStall && SystemClock.uptimeMillis() - started >= 200) {
                     reportedStall = true
                     Log.w(TAG, "Decoder input backpressure; retaining compressed frame")
@@ -372,10 +375,18 @@ class VideoRenderer(ctx: Context) {
         codecSurface = surface
         pipeline.setDisplaySurface(if (usesDirectSurface()) null else displaySurface)
         codecName = (if (h265) "H.265" else "H.264") + " (${c.name})"
+        outputDrainer = OutputDrainer(c).also { it.start() }
         Log.i(TAG, "Decoder output: ${if (surface === displaySurface) "direct SurfaceView" else "GL pipeline"}")
     }
 
     private fun stopCodec() {
+        // Join before stop(): the drainer never takes the renderer lock.
+        outputDrainer?.let {
+            it.halt()
+            it.join(1000)
+            if (it.isAlive) Log.w(TAG, "Decoder output thread did not stop within 1s")
+        }
+        outputDrainer = null
         _frameIntervalIdx = 0
         _frameIntervalCount = 0
         _lastOutputFrameNs = 0L
@@ -391,27 +402,46 @@ class VideoRenderer(ctx: Context) {
         codecSurface = null
     }
 
-    private fun drainOutput() {
-        val c = codec ?: return
-        val info = MediaCodec.BufferInfo()
-        while (true) {
-            val idx = c.dequeueOutputBuffer(info, 0)
-            if (idx < 0) break
-            _recordOutputFrameTime()
-            if (scheduledOutputBufferRelease) {
-                // schedule frame at VSYNC matching its NTP presentation time
-                val ptsUs = info.presentationTimeUs
-                if (_ptsBaseUs == Long.MIN_VALUE) {
-                    _ptsBaseUs = ptsUs
-                    _wallBaseNs = System.nanoTime()
+    // Releases each decoded frame as soon as the decoder produces it, instead
+    // of when the next compressed frame happens to arrive from the network.
+    // MediaCodec queues are thread-safe; this thread never takes the renderer
+    // lock, so stopCodec() can join it while holding that lock.
+    private inner class OutputDrainer(private val c: MediaCodec) : Thread("VideoOutput") {
+        @Volatile private var running = true
+
+        fun halt() { running = false }
+
+        override fun run() {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
+            val info = MediaCodec.BufferInfo()
+            try {
+                while (running) {
+                    val idx = c.dequeueOutputBuffer(info, OUTPUT_WAIT_US)
+                    if (idx >= 0) _releaseOutput(c, idx, info)
                 }
-                c.releaseOutputBuffer(idx, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
-            } else {
-                // AirPlay PTS uses an NTP epoch; SurfaceView timestamps must use
-                // the monotonic clock, including immediate output.
-                c.releaseOutputBuffer(idx, System.nanoTime())
+            } catch (e: IllegalStateException) {
+                // Stopped or failed codec; the input side resets it on its next call.
+                if (running) Log.w(TAG, "Decoder output stopped", e)
             }
         }
+    }
+
+    private fun _releaseOutput(c: MediaCodec, idx: Int, info: MediaCodec.BufferInfo) {
+        _recordOutputFrameTime()
+        if (scheduledOutputBufferRelease) {
+            // schedule frame at VSYNC matching its NTP presentation time
+            val ptsUs = info.presentationTimeUs
+            if (_ptsBaseUs == Long.MIN_VALUE) {
+                _ptsBaseUs = ptsUs
+                _wallBaseNs = System.nanoTime()
+            }
+            c.releaseOutputBuffer(idx, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
+        } else {
+            // AirPlay PTS uses an NTP epoch; SurfaceView timestamps must use
+            // the monotonic clock, including immediate output.
+            c.releaseOutputBuffer(idx, System.nanoTime())
+        }
+        decodedFrames++
     }
 
     fun release() = synchronized(lock) {
@@ -452,6 +482,11 @@ class VideoRenderer(ctx: Context) {
     companion object {
         private const val TAG = "VideoRenderer"
         private const val BENCH_TAG = "BENCHMARK"
-        private const val FEED_WAIT_US = 20_000L
+        // Poll input without blocking inside the codec while holding the lock;
+        // awaitCodecInput() waits on the monitor so Stop/Surface calls get in.
+        private const val FEED_WAIT_US = 0L
+        // Bounds how long stopCodec() waits for the output thread; a ready
+        // frame still wakes dequeueOutputBuffer immediately.
+        private const val OUTPUT_WAIT_US = 10_000L
     }
 }
